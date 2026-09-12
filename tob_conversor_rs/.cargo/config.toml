@@ -1,0 +1,6 @@
+# Enable native CPU instruction set (AVX2, NEON, etc.) for all builds.
+# This lets LLVM auto-vectorize decode loops and unlocks SIMD paths inside
+# the Arrow and SNAPPY libraries.  Binaries built with this flag are NOT
+# portable to machines with older CPUs than the build machine.
+[build]
+rustflags = ["-C", "target-cpu=native"]

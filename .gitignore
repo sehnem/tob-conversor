@@ -1,0 +1,24 @@
+# Rust
+target/
+data/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Temp
+*.tmp

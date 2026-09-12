@@ -1,0 +1,138 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – CS_121.dat",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${workspaceFolder}/data",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – CS_121.dat (with RECORD column)",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${workspaceFolder}/data",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1",
+        "--record"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – CS_131.dat",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${workspaceFolder}/data/CS_131.dat",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – large CS_120.dat (2 GB, slow)",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${workspaceFolder}/data/CS_120.dat",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – CS_121.dat (Parquet)",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${workspaceFolder}/data",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1",
+        "--format", "parquet"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – CS_121.dat (Parquet + RECORD)",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${workspaceFolder}/data",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1",
+        "--format", "parquet",
+        "--record"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – custom path",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${input:inputDir}",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug CLI – custom path (Parquet)",
+      "cargo": {
+        "args": ["build", "--bin=tob3conversor"],
+        "filter": { "name": "tob3conversor", "kind": "bin" }
+      },
+      "args": [
+        "${input:inputDir}",
+        "-o", "${workspaceFolder}/target/debug_out",
+        "--jobs", "1",
+        "--format", "parquet"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "inputDir",
+      "type": "promptString",
+      "description": "Path to input directory or .dat file",
+      "default": "${workspaceFolder}/data"
+    }
+  ]
+}

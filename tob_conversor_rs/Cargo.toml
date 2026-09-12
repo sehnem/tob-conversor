@@ -1,0 +1,23 @@
+[package]
+name = "tobconversor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tobconversor"
+# rlib: usable as a Rust dependency (e.g. by a tob3-python PyO3 wrapper crate).
+# cdylib should be declared in the consuming wrapper crate, not here.
+crate-type = ["rlib"]
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+rayon = "1.8"
+chrono = "0.4"
+parquet = { version = "58.1.0", features = ["arrow"] }
+arrow-array = "58.1.0"
+arrow-schema = "58.1.0"
+arrow-ipc = "58.1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1

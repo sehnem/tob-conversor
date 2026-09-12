@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: ruff check
+        run: |
+          pip install ruff
+          ruff check tob_conversor_py/python/ examples/
+          ruff format --check tob_conversor_py/python/ examples/
+
+      - name: cargo fmt
+        run: cargo fmt --check --manifest-path tob_conversor_rs/Cargo.toml
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path tob_conversor_rs/Cargo.toml -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path tob_conversor_rs/Cargo.toml
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install maturin and build
+        run: |
+          pip install maturin
+          cd tob_conversor_py && maturin develop --release
+
+      - name: Install test dependencies
+        run: pip install pytest pytest-cov matplotlib numpy
+
+      - name: Run tests
+        run: pytest tob_conversor_py/tests/ -v --tb=short

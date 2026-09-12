@@ -1,0 +1,45 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --
+        language: system
+        types: [rust]
+        pass_filenames: true
+
+      - id: maturin-develop
+        name: maturin develop (build & install)
+        entry: uv run --directory tob_conversor_py maturin develop
+        language: system
+        pass_filenames: false
+        types_or: [python, rust]
+
+      - id: ty-check
+        name: ty type check
+        entry: uv run --directory tob_conversor_py ty check
+        language: system
+        pass_filenames: false
+        types_or: [python, rust]
+
+      - id: pytest
+        name: pytest
+        entry: uv run --directory tob_conversor_py pytest
+        language: system
+        pass_filenames: false
+        types_or: [python, rust]

@@ -1,0 +1,3 @@
+[workspace]
+members = ["tob_conversor_rs", "tob_conversor_py"]
+resolver = "2"
