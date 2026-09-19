@@ -28,6 +28,7 @@ pub enum CsciType {
 }
 
 impl CsciType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         let s = s.trim_matches('"');
         if s.starts_with("ASCII(") {

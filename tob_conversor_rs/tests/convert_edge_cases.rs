@@ -169,3 +169,87 @@ fn include_record_column_position() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A pre-allocated TOB3 ring keeps whatever was on the card past its write
+/// pointer. Roughly one such junk frame in 2^17 carries a footer word whose
+/// high half happens to equal this table's validation stamp, and the old
+/// reader took it: its first 12 bytes became seconds/subseconds/record, which
+/// is where timestamps like 1990-01-01 and 2126-02-12 came from.
+#[test]
+fn stamp_colliding_junk_frame_after_the_data_is_not_emitted() {
+    let dir = temp_dir("ring_junk");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("ring.dat");
+
+    // 2021-08-27-ish, so a leaked epoch-zero frame is unmistakable.
+    const T0: u32 = 998_911_270;
+
+    let mut blob = header_block("CR1000", 20, VAL_STAMP).into_bytes();
+    // Three genuine frames: one record each, record numbers 0, 1, 2.
+    blob.extend(one_frame(T0, 0, VAL_STAMP));
+    blob.extend(one_frame(T0 + 1, 1, VAL_STAMP));
+    blob.extend(one_frame(T0 + 2, 2, VAL_STAMP));
+    // Unwritten ring space that collides on the stamp. `seconds = 0` is the
+    // CSI epoch, so this frame would surface as 1990-01-01.
+    blob.extend(one_frame(0, 0xDEAD_BEEF, VAL_STAMP));
+    fs::File::create(&input).unwrap().write_all(&blob).unwrap();
+
+    let out = dir.join("out");
+    convert_streaming(&input, &out, 30, false).unwrap();
+
+    let text: String = fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "dat").unwrap_or(false))
+        .map(|p| fs::read_to_string(p).unwrap())
+        .collect();
+    assert!(
+        !text.contains("1990-01-01"),
+        "junk ring frame leaked into the output:\n{text}"
+    );
+    let rows = text
+        .lines()
+        .filter(|l| l.starts_with("\"19") || l.starts_with("\"20"))
+        .count();
+    assert_eq!(rows, 3, "expected exactly the 3 genuine records:\n{text}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The genuine counterpart: after a real discontinuity (a logger restart resets
+/// the record number) the run picks up again, because the frame that follows
+/// corroborates it.
+#[test]
+fn record_number_reset_is_kept_when_the_next_frame_confirms_it() {
+    let dir = temp_dir("ring_reset");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("reset.dat");
+
+    let mut blob = header_block("CR1000", 20, VAL_STAMP).into_bytes();
+    blob.extend(one_frame(100, 0, VAL_STAMP));
+    blob.extend(one_frame(101, 1, VAL_STAMP));
+    // Logger restarted: record numbers begin again at 0.
+    blob.extend(one_frame(200, 0, VAL_STAMP));
+    blob.extend(one_frame(201, 1, VAL_STAMP));
+    fs::File::create(&input).unwrap().write_all(&blob).unwrap();
+
+    let out = dir.join("out");
+    convert_streaming(&input, &out, 30, false).unwrap();
+
+    let rows: usize = fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "dat").unwrap_or(false))
+        .map(|p| fs::read_to_string(p).unwrap().lines().skip(4).count())
+        .sum();
+    assert_eq!(
+        rows, 4,
+        "a confirmed record-number reset must not lose rows"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
