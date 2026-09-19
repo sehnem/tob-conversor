@@ -10,14 +10,45 @@ loading for large files, and a CLI for batch TOA5 / Parquet export.
 
 | | |
 |---|---|
-| **Input formats** | TOB1, TOB2, TOB3 (auto-detected from the 6-line ASCII header) |
+| **Input formats** | TOB1 (5-line header), TOB2 / TOB3 (6-line header) — auto-detected |
 | **Python engines** | `pandas`, `polars`, `duckdb` |
 | **Lazy / chunked** | `scan_tob` (Polars lazy frame) and `read_tob_chunks` (pandas iterator) |
 | **Schema introspection** | `read_header` — parse metadata without touching binary data |
 | **Column types** | 21 Campbell Scientific types (IEEE4, FP2, INT, BOOL, ASCII, NSEC…) |
 | **NaN handling** | Logger-model-aware FP2 thresholds; `None` / `NaN` in every engine |
+| **Ring-buffer safety** | Unwritten TOB3 ring space is rejected, not decoded as data ([below](#tob3-is-a-ring-buffer)) |
+| **Header encoding** | UTF-8 with a Latin-1 fallback, so `W/m²` and accented station names parse |
 | **CLI output** | TOA5 ASCII (30-min split files) or Apache Parquet |
 | **Parallel CLI** | Folder conversions use Rayon (`--jobs N`) |
+
+### TOB3 is a ring buffer
+
+A TOB3 file is **pre-allocated**: the logger reserves its whole *intended table
+size* up front and overwrites frames in place. Everything past the write
+pointer is not padding — it is whatever was on the card before, which on a
+reused card means frames of another table, another program, or plain flash
+garbage.
+
+The only marker distinguishing a real frame is a 16-bit validation stamp in the
+frame footer, so testing the stamp alone accepts about one junk frame in 2^17.
+On a 2 GB card image that is roughly a dozen accepted junk frames, and each one
+decodes its leading 12 bytes as seconds / subseconds / record number — yielding
+a frame's worth of rows dated anywhere from **1990-01-01** (seconds ≈ 0, the
+Campbell epoch) to **2126-02-12** (seconds ≈ 2³²). A single such row is enough
+to ruin a min/max, a partition key, or an axis.
+
+This reader therefore also requires that:
+
+- the footer's **offset field fits inside the frame** and only appears together
+  with the minor-frame flag; and
+- the frame's **`beg` record number continues the previous frame**. A frame at
+  a genuine discontinuity (logger restart, ring wrap) is held until the *next*
+  frame corroborates it, so real data survives while junk — which never lines
+  up twice — does not.
+
+Rejections are counted rather than hidden: `convert_streaming_with_stats` and
+`TobBatchReader::frame_stats` report `frames_read`, `frames_accepted`,
+`rejected_footer` and `rejected_unconfirmed`.
 
 ---
 

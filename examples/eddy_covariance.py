@@ -9,7 +9,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
-
 import tob
 
 DATA = Path(__file__).parent.parent / "data" / "CS_120.dat"

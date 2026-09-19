@@ -14,7 +14,6 @@ from pathlib import Path
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-
 import tob
 
 DATA = Path(__file__).parent.parent / "data" / "CS_120.dat"

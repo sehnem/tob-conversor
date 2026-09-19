@@ -52,10 +52,11 @@ def _tob3_frame(
 
 
 def _tob1_header() -> bytes:
+    # TOB1 has a five-line prolog: no table/frame-geometry line, and the table
+    # name lives on the environment line. Binary records follow immediately.
     lines = "\n".join(
         [
-            '"TOB1","ST","CR1000X","123","OS","PROG","SIG","2020-01-01 00:00:00"',
-            '"T1","1 SEC","0","0","0","SecNanosec","0","0","0"',
+            '"TOB1","ST","CR1000X","123","OS","PROG","SIG","T1"',
             '"SECONDS","NANOSECONDS","RECORD","A","B"',
             '"Seconds","Nanoseconds","","V","V"',
             '"","","","Smp","Smp"',

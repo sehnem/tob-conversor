@@ -15,8 +15,9 @@ use arrow_ipc::writer::{FileWriter, StreamWriter};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 use super::decode::{FieldValue, decode_field_value, time_ns_from_frame_header};
+use super::frame_gate::{Admit, FrameGate, FrameStats};
 use super::header::{TobHeader, parse_tob_header};
-use super::subframe::{is_valid_main_frame, scan_and_skip_subframe_boundary};
+use super::subframe::walk_frame;
 use super::types::CsciType;
 
 /// Default batch size — keeps peak memory at ~4–10 MiB per chunk.
@@ -351,45 +352,10 @@ pub(crate) fn build_schema(header: &TobHeader, include_record: bool) -> Schema {
 
 // ── Frame and record collectors ───────────────────────────────────────────────
 
-pub(crate) fn collect_frame(frame_buf: &[u8], header: &TobHeader, buffers: &mut Buffers) {
-    let mut seconds = u32::from_le_bytes(frame_buf[0..4].try_into().unwrap());
-    let mut subseconds = u32::from_le_bytes(frame_buf[4..8].try_into().unwrap());
-    let main_beg = if header.is_tob2 {
-        0
-    } else {
-        u32::from_le_bytes(frame_buf[8..12].try_into().unwrap())
-    };
-
-    let mut frame_time_ns = time_ns_from_frame_header(seconds, subseconds, header.frame_time_res);
-    let mut next_record_id = main_beg;
-
-    let data_end = header.frame_nbytes.saturating_sub(4);
-    let line_step = header.line_nbytes + header.data_line_padding;
-    let mut off = if header.is_tob2 { 8usize } else { 12usize };
-
-    while off < data_end {
-        if scan_and_skip_subframe_boundary(
-            frame_buf,
-            &mut off,
-            data_end,
-            header,
-            next_record_id,
-            &mut seconds,
-            &mut subseconds,
-            &mut frame_time_ns,
-        ) {
-            continue;
-        }
-
-        if off + header.line_nbytes > data_end {
-            break;
-        }
-
-        let line_bytes = &frame_buf[off..off + header.line_nbytes];
-        off += line_step;
-
+pub(crate) fn collect_frame(frame_buf: &[u8], header: &TobHeader, buffers: &mut Buffers) -> usize {
+    walk_frame(frame_buf, header, |line_bytes, frame_time_ns, record_id| {
         buffers.timestamps.push(frame_time_ns);
-        buffers.records.push(next_record_id as i64);
+        buffers.records.push(record_id as i64);
         let mut byte_off = 0;
         for (dt, col_buf) in header.csci_dtypes.iter().zip(buffers.cols.iter_mut()) {
             let sz = dt.size();
@@ -397,10 +363,7 @@ pub(crate) fn collect_frame(frame_buf: &[u8], header: &TobHeader, buffers: &mut 
             col_buf.push_field_value(fv);
             byte_off += sz;
         }
-
-        next_record_id = next_record_id.wrapping_add(1);
-        frame_time_ns += (header.rec_intvl * 1_000_000_000.0) as i64;
-    }
+    })
 }
 
 pub(crate) fn collect_tob1_record(record_buf: &[u8], header: &TobHeader, buffers: &mut Buffers) {
@@ -471,6 +434,7 @@ pub struct TobBatchReader {
     done: bool,
     frame_buf: Vec<u8>,
     record_buf: Vec<u8>,
+    gate: FrameGate,
 }
 
 impl TobBatchReader {
@@ -502,6 +466,7 @@ impl TobBatchReader {
             done: false,
             frame_buf,
             record_buf,
+            gate: FrameGate::new(),
         })
     }
 
@@ -511,6 +476,12 @@ impl TobBatchReader {
 
     pub fn header(&self) -> &TobHeader {
         &self.header
+    }
+
+    /// Main frames read so far, and how many were rejected as not belonging to
+    /// this table.  Meaningful once iteration has finished.
+    pub fn frame_stats(&self) -> FrameStats {
+        self.gate.stats()
     }
 }
 
@@ -524,12 +495,9 @@ impl Iterator for TobBatchReader {
 
         if self.header.is_tob1 {
             loop {
-                match self.reader.read_exact(&mut self.record_buf) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        self.done = true;
-                        break;
-                    }
+                if self.reader.read_exact(&mut self.record_buf).is_err() {
+                    self.done = true;
+                    break;
                 }
                 collect_tob1_record(&self.record_buf, &self.header, &mut self.buffers);
                 if self.buffers.len() >= self.batch_size {
@@ -538,17 +506,29 @@ impl Iterator for TobBatchReader {
             }
         } else {
             loop {
-                match self.reader.read_exact(&mut self.frame_buf) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        self.done = true;
-                        break;
+                if self.reader.read_exact(&mut self.frame_buf).is_err() {
+                    self.done = true;
+                    self.gate.finish();
+                    break;
+                }
+                let header = &self.header;
+                let verdict = self.gate.admit(&self.frame_buf, header, |f| {
+                    walk_frame(f, header, |_, _, _| {})
+                });
+                match verdict {
+                    Admit::Skip => continue,
+                    Admit::Current => {
+                        let rows = collect_frame(&self.frame_buf, &self.header, &mut self.buffers);
+                        self.gate.advance(rows);
+                    }
+                    Admit::HeldThenCurrent => {
+                        if let Some(held) = self.gate.take_held() {
+                            collect_frame(&held, &self.header, &mut self.buffers);
+                        }
+                        let rows = collect_frame(&self.frame_buf, &self.header, &mut self.buffers);
+                        self.gate.advance(rows);
                     }
                 }
-                if !is_valid_main_frame(&self.frame_buf, &self.header) {
-                    continue;
-                }
-                collect_frame(&self.frame_buf, &self.header, &mut self.buffers);
                 if self.buffers.len() >= self.batch_size {
                     break;
                 }

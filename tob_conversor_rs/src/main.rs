@@ -117,7 +117,7 @@ fn run_tasks(tasks: Vec<Task>, jobs: usize, include_record: bool, format: &Outpu
         println!("Parallel: {} worker threads", thread_display);
     }
 
-    let total_written = if jobs == 1 {
+    if jobs == 1 {
         let mut acc = 0;
         for task in tasks {
             let name = task.file.file_name().unwrap_or_default().to_string_lossy();
@@ -163,9 +163,7 @@ fn run_tasks(tasks: Vec<Task>, jobs: usize, include_record: bool, format: &Outpu
                 .collect()
         });
         results.iter().sum()
-    };
-
-    total_written
+    }
 }
 
 fn main() {

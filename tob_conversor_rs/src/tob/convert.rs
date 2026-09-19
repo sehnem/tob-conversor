@@ -7,8 +7,9 @@ use std::path::Path;
 use super::decode::{
     file_datetime_stamp, format_field_toa5, format_ns_timestamp, time_ns_from_frame_header,
 };
+use super::frame_gate::{Admit, FrameGate, FrameStats};
 use super::header::{TobHeader, parse_tob_header};
-use super::subframe::{is_valid_main_frame, scan_and_skip_subframe_boundary};
+use super::subframe::walk_frame;
 
 struct FrameOutput<'a> {
     current_interval: i64,
@@ -78,65 +79,58 @@ fn emit_one_row(
     Ok(())
 }
 
-fn emit_frame(frame_buf: &[u8], header: &TobHeader, out: &mut FrameOutput) -> Result<(), String> {
+fn emit_frame(
+    frame_buf: &[u8],
+    header: &TobHeader,
+    out: &mut FrameOutput,
+) -> Result<usize, String> {
     let mut row_buf = String::with_capacity(256);
-    let mut seconds = u32::from_le_bytes(frame_buf[0..4].try_into().unwrap());
-    let mut subseconds = u32::from_le_bytes(frame_buf[4..8].try_into().unwrap());
-    let main_beg = if header.is_tob2 {
-        0
-    } else {
-        u32::from_le_bytes(frame_buf[8..12].try_into().unwrap())
-    };
+    let mut failure: Option<String> = None;
 
-    let mut frame_time_ns = time_ns_from_frame_header(seconds, subseconds, header.frame_time_res);
-    let mut next_record_id = main_beg;
-
-    let data_end = header.frame_nbytes.saturating_sub(4);
-    let line_step = header.line_nbytes + header.data_line_padding;
-    let mut off = if header.is_tob2 { 8usize } else { 12usize };
-
-    while off < data_end {
-        if scan_and_skip_subframe_boundary(
-            frame_buf,
-            &mut off,
-            data_end,
-            header,
-            next_record_id,
-            &mut seconds,
-            &mut subseconds,
-            &mut frame_time_ns,
-        ) {
-            continue;
+    let rows = walk_frame(frame_buf, header, |line_bytes, frame_time_ns, record_id| {
+        if failure.is_some() {
+            return;
         }
-
-        if off + header.line_nbytes > data_end {
-            break;
-        }
-
-        let line_bytes = &frame_buf[off..off + header.line_nbytes];
-        off += line_step;
-
-        emit_one_row(
+        if let Err(e) = emit_one_row(
             line_bytes,
             header,
             frame_time_ns,
-            next_record_id,
+            record_id,
             out,
             &mut row_buf,
-        )?;
-        next_record_id = next_record_id.wrapping_add(1);
-        frame_time_ns += (header.rec_intvl * 1_000_000_000.0) as i64;
-    }
+        ) {
+            failure = Some(e);
+        }
+    });
 
-    Ok(())
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(rows),
+    }
 }
 
+/// Convert a TOB file to TOA5 files in `output_dir`, returning the number of
+/// files written.
 pub fn convert_streaming(
     input: &Path,
     output_dir: &Path,
     split_interval_minutes: usize,
     include_record: bool,
 ) -> Result<usize, String> {
+    convert_streaming_with_stats(input, output_dir, split_interval_minutes, include_record)
+        .map(|(files, _)| files)
+}
+
+/// As [`convert_streaming`], but also reports how many main frames were read
+/// and how many were rejected as not belonging to this table — the unwritten
+/// tail of a pre-allocated TOB3 ring usually dwarfs the real data, and a caller
+/// recording provenance wants that number rather than a silent difference.
+pub fn convert_streaming_with_stats(
+    input: &Path,
+    output_dir: &Path,
+    split_interval_minutes: usize,
+    include_record: bool,
+) -> Result<(usize, FrameStats), String> {
     let file = File::open(input).map_err(|e| format!("Open error: {}", e))?;
     let mut buff = BufReader::new(file);
 
@@ -191,15 +185,15 @@ pub fn convert_streaming(
         include_record,
     };
 
+    let mut frame_stats = FrameStats::default();
+
     if header.is_tob1 {
         let record_size = 12 + header.line_nbytes; // seconds(4) + ns(4) + record_id(4) + data
         let mut record_buf = vec![0u8; record_size];
         let mut row_buf = String::with_capacity(256);
-        loop {
-            match buff.read_exact(&mut record_buf) {
-                Ok(()) => {}
-                Err(_) => break, // EOF or truncated record at end of file
-            }
+        // A short read means EOF or a truncated trailing record; either way the
+        // file is done.
+        while buff.read_exact(&mut record_buf).is_ok() {
             let seconds = u32::from_le_bytes(record_buf[0..4].try_into().unwrap());
             let subseconds = u32::from_le_bytes(record_buf[4..8].try_into().unwrap());
             let record_id = u32::from_le_bytes(record_buf[8..12].try_into().unwrap());
@@ -219,21 +213,32 @@ pub fn convert_streaming(
             return Err("frame_nbytes is 0 in non-TOB1 file".to_string());
         }
         let mut frame_buf = vec![0u8; header.frame_nbytes];
-        loop {
-            match buff.read_exact(&mut frame_buf) {
-                Ok(()) => {}
-                Err(_) => break,
+        let mut gate = FrameGate::new();
+        while buff.read_exact(&mut frame_buf).is_ok() {
+            match gate.admit(&frame_buf, &header, |f| {
+                walk_frame(f, &header, |_, _, _| {})
+            }) {
+                Admit::Skip => continue,
+                Admit::Current => {
+                    let rows = emit_frame(&frame_buf, &header, &mut out)?;
+                    gate.advance(rows);
+                }
+                Admit::HeldThenCurrent => {
+                    if let Some(held) = gate.take_held() {
+                        emit_frame(&held, &header, &mut out)?;
+                    }
+                    let rows = emit_frame(&frame_buf, &header, &mut out)?;
+                    gate.advance(rows);
+                }
             }
-            if !is_valid_main_frame(&frame_buf, &header) {
-                continue;
-            }
-            emit_frame(&frame_buf, &header, &mut out)?;
         }
+        gate.finish();
+        frame_stats = gate.stats();
     }
 
     if let Some(mut w) = out.out_file.take() {
         let _ = w.flush();
     }
 
-    Ok(out.written_files_count)
+    Ok((out.written_files_count, frame_stats))
 }
