@@ -1,0 +1,13 @@
+# Repo-wide Ruff settings.
+#
+# `tob_conversor_py/` carries its own [tool.ruff] in pyproject.toml; this file
+# covers everything outside it — `examples/` in particular, which otherwise
+# falls back to Ruff's built-in defaults. Those defaults move between releases,
+# and CI installs Ruff unpinned, so without this the lint job can start failing
+# on code nobody touched. Keep the two in sync.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]

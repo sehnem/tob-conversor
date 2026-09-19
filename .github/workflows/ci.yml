@@ -16,13 +16,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: the jobs below gate on `-D warnings`, so a floating `stable`
+      # turns every new Clippy lint into a red build on untouched code.
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt
 
       - name: ruff check
         run: |
-          pip install ruff
+          pip install 'ruff==0.16.7'
           ruff check tob_conversor_py/python/ examples/
           ruff format --check tob_conversor_py/python/ examples/
 
@@ -35,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy
 
@@ -57,14 +59,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install maturin and build
+      # `maturin develop` installs into an *active* virtualenv, and
+      # actions/setup-python does not provide one, so it fails before it builds.
+      # Build a wheel and install that into the job's interpreter instead.
+      # Install the built file by path, never `pip install tob`: the name `tob`
+      # on PyPI is an unrelated project.
+      - name: Build and install the extension
         run: |
           pip install maturin
-          cd tob_conversor_py && maturin develop --release
+          maturin build --release --manifest-path tob_conversor_py/Cargo.toml --out dist
+          pip install dist/*.whl
 
       - name: Install test dependencies
         run: pip install pytest pytest-cov matplotlib numpy

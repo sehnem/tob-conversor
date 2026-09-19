@@ -219,16 +219,11 @@ pub fn parse_tob_header(buff: &mut impl BufRead) -> std::io::Result<TobHeader> {
 
     let header_size = if is_tob2 { 8 } else { 12 };
     let data_segment = frame_nbytes.saturating_sub(header_size + 4);
-    let data_nlines = if line_nbytes > 0 {
-        data_segment / line_nbytes
-    } else {
-        0
-    };
-    let data_line_padding = if data_nlines > 0 {
-        (data_segment - data_nlines * line_nbytes) / data_nlines
-    } else {
-        0
-    };
+    // A header declaring no columns leaves both of these at 0 rather than dividing by zero.
+    let data_nlines = data_segment.checked_div(line_nbytes).unwrap_or(0);
+    let data_line_padding = (data_segment - data_nlines * line_nbytes)
+        .checked_div(data_nlines)
+        .unwrap_or(0);
 
     Ok(TobHeader {
         is_tob1,
