@@ -2,6 +2,7 @@
 //! and the walk that turns one main frame into rows.
 
 use super::decode::time_ns_from_frame_header;
+use super::frame_gate::footer_offset_fits;
 use super::header::TobHeader;
 
 /// Where in time the next record of a frame sits.
@@ -21,17 +22,53 @@ impl FrameClock {
     }
 }
 
-/// Skip optional padding, `4-byte sub-footer`, and `12-byte sub-header` when the
-/// footer matches the table stamp and the sub-header record id matches `next_record_id`.
+/// True when `word` could be the sub-footer that opens a sub-frame boundary.
 ///
-/// The stamp must match **exactly**.  An earlier version accepted any stamp in
-/// the same 16-value bucket (`& 0xFFF0`), which multiplied the odds that a run
-/// of ordinary measurement bytes would be mistaken for a boundary by 16 — and a
-/// phantom boundary is expensive: it resets the frame clock from data bytes and
-/// shifts every following row in the frame by 16 bytes, so every column reads
-/// one field late.  Files whose frames carry a `stamp + 1` footer (CardConvert
-/// card fragments) are handled by rewriting the header stamp, not by loosening
-/// this test.
+/// Two independent structural tests, neither fitted to a particular file:
+///
+/// * the stamp is the table's validation stamp, its complement, or **either one
+///   off by one**. Campbell firmware writes off-by-one stamps in both
+///   directions — `val_stamp - 1` on the sub-frame boundaries of CR1000 1-minute
+///   tables, `val_stamp + 1` on the main footers of CardConvert card fragments.
+///   The rule follows that arithmetic, rather than the older `& 0xFFF0` bucket,
+///   which covers `val_stamp - 1` only when the low nibble happens not to
+///   borrow: for a stamp of `0x6110` it would miss `0x610F` entirely.
+/// * the offset field fits inside the frame, the same invariant every main
+///   footer obeys.
+///
+/// Scored against `beg`-derived ground truth over 16,024 frames in 8 files from
+/// 6 sites, counting frames whose walked record count disagreed: exact stamp 3,
+/// no stamp test 3, offset test alone 1, this rule 0. See
+/// `tests/subframe_beg_agreement.rs`, which re-runs that scoring on any file.
+fn boundary_word_is_plausible(word: u32, header: &TobHeader) -> bool {
+    let stamp = (word >> 16) as u16;
+    let near = [header.val_stamp, header.comp_val_stamp]
+        .iter()
+        .any(|&s| stamp == s || stamp == s.wrapping_sub(1) || stamp == s.wrapping_add(1));
+    near && footer_offset_fits(word, header)
+}
+
+/// Skip optional padding, `4-byte sub-footer`, and `12-byte sub-header` when the
+/// footer looks like the table stamp and the sub-header record id matches
+/// `next_record_id`.
+///
+/// **The record id is the real test, not the stamp.** `next_record_id` is a
+/// 32-bit value the caller already knows, so requiring it to match exactly puts
+/// the odds of mistaking measurement bytes for a boundary at about 2^-32 on its
+/// own. The stamp is a cheap pre-filter in front of it.
+///
+/// And the stamp genuinely varies: sub-frame boundaries in this archive are
+/// routinely written with `val_stamp - 1` (Estancia_chale `CS_131.dat`, where
+/// the table stamp is 24855 and every boundary carries 24854), the same
+/// off-by-one family as the CardConvert fragments whose *main* frame footers
+/// carry `val_stamp + 1`. Demanding an exact match here makes the scanner walk
+/// straight past those boundaries, over-count the frame by a record, and
+/// desynchronise the record sequence for everything after it — which then looks
+/// like a discontinuity and costs real rows.
+///
+/// So: accept the neighbourhood of the stamp, and let the record id decide.
+/// TOB2 has no record id in its sub-header, so there the stamp has to carry the
+/// whole check and stays exact.
 pub(crate) fn scan_and_skip_subframe_boundary(
     frame_buf: &[u8],
     off: &mut usize,
@@ -51,15 +88,20 @@ pub(crate) fn scan_and_skip_subframe_boundary(
             break;
         }
         let word = u32::from_le_bytes(frame_buf[o..o + 4].try_into().unwrap());
-        let stamp = (word >> 16) as u16;
-        if stamp != header.val_stamp && stamp != header.comp_val_stamp {
+        if !boundary_word_is_plausible(word, header) {
             continue;
         }
         if (word >> 13) & 1 != 0 {
             continue;
         }
 
-        if !header.is_tob2 {
+        if header.is_tob2 {
+            // No record id to corroborate with: the stamp must be exact.
+            let stamp = (word >> 16) as u16;
+            if stamp != header.val_stamp && stamp != header.comp_val_stamp {
+                continue;
+            }
+        } else {
             let hdr_rec = u32::from_le_bytes(frame_buf[o + 12..o + 16].try_into().unwrap());
             if hdr_rec != next_record_id {
                 continue;
@@ -160,6 +202,80 @@ mod tests {
         f.extend_from_slice(&[0x45u8, 0x8e, 0x45, 0x8e]);
         f.extend_from_slice(&((stamp as u32) << 16).to_le_bytes());
         f
+    }
+
+    /// Frame with one record, a sub-frame boundary, then one more record.
+    /// `boundary_stamp` lets a test write the `val_stamp - 1` that real
+    /// loggers use. 36 bytes: 12 header + 2 + 16 + 2 + 4 footer.
+    fn frame_with_boundary(beg: u32, boundary_stamp: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&100u32.to_le_bytes()); // seconds
+        f.extend_from_slice(&0u32.to_le_bytes()); // subseconds
+        f.extend_from_slice(&beg.to_le_bytes()); // beg record
+        f.extend_from_slice(&[0x45, 0x8e]); // record `beg`
+        f.extend_from_slice(&((boundary_stamp as u32) << 16).to_le_bytes()); // sub-footer
+        f.extend_from_slice(&200u32.to_le_bytes()); // sub seconds (new time base)
+        f.extend_from_slice(&0u32.to_le_bytes()); // sub subseconds
+        f.extend_from_slice(&(beg + 1).to_le_bytes()); // sub-header record id
+        f.extend_from_slice(&[0x45, 0x8e]); // record `beg + 1`
+        f.extend_from_slice(&((4660u32) << 16).to_le_bytes()); // main footer
+        assert_eq!(f.len(), 36);
+        f
+    }
+
+    fn header_36() -> TobHeader {
+        let hdr = r#""TOB3","S","CR1000","1","O","P","G","D"
+"T","1 SEC","36","0","4660","SecMsec","0","0","0"
+"a"
+"u"
+"S"
+"FP2"
+"#;
+        parse_tob_header(&mut Cursor::new(hdr)).unwrap()
+    }
+
+    /// The boundary stamp in this archive is routinely `val_stamp - 1`
+    /// (Estancia_chale CS_131.dat: table stamp 24855, every boundary 24854).
+    /// Missing it makes the walker read the 16 boundary bytes as data, so the
+    /// frame reports more records than it holds and every later frame looks
+    /// like a discontinuity.
+    #[test]
+    fn subframe_boundary_is_found_when_its_stamp_is_off_by_one() {
+        let h = header_36();
+        for stamp in [4659u16, 4660, 4661] {
+            let frame = frame_with_boundary(27_698, stamp);
+            let mut ids = Vec::new();
+            let n = walk_frame(&frame, &h, |_, _, rec| ids.push(rec));
+            assert_eq!(n, 2, "stamp {stamp}: expected 2 records, walked {n}");
+            assert_eq!(ids, vec![27_698, 27_699], "stamp {stamp}");
+        }
+    }
+
+    /// The record id is what actually confirms a boundary: a stamp in range but
+    /// a record id that does not continue the frame is not a boundary.
+    #[test]
+    fn a_near_stamp_with_the_wrong_record_id_is_not_a_boundary() {
+        let h = header_36();
+        let mut frame = frame_with_boundary(27_698, 4659);
+        // Break only the sub-header record id.
+        frame[26..30].copy_from_slice(&9_999_999u32.to_le_bytes());
+        let n = walk_frame(&frame, &h, |_, _, _| {});
+        assert!(
+            n > 2,
+            "boundary must not be taken on the stamp alone (got {n})"
+        );
+    }
+
+    /// The sub-frame boundary restates the frame clock.
+    #[test]
+    fn crossing_a_boundary_resets_the_frame_clock() {
+        let h = header_36();
+        let frame = frame_with_boundary(27_698, 4659);
+        let mut times = Vec::new();
+        walk_frame(&frame, &h, |_, ns, _| times.push(ns));
+        assert_eq!(times.len(), 2);
+        // 100 s then 200 s from the Campbell epoch, not 100 s then 101 s.
+        assert_eq!(times[1] - times[0], 100 * 1_000_000_000);
     }
 
     #[test]

@@ -89,10 +89,7 @@ pub fn is_valid_main_frame(frame_buf: &[u8], header: &TobHeader) -> bool {
         return false;
     }
 
-    // The data segment: frame bytes minus the frame header and the footer.
-    let header_size = if header.is_tob2 { 8 } else { 12 };
-    let capacity = header.frame_nbytes.saturating_sub(header_size + 4);
-
+    let capacity = frame_capacity(header);
     let offset = (footer & footer::OFFSET_MASK) as usize;
     if offset > capacity {
         // Junk: a real offset counts bytes *inside* this frame.
@@ -104,6 +101,21 @@ pub fn is_valid_main_frame(frame_buf: &[u8], header: &TobHeader) -> bool {
     }
     let _ = (footer::FLAG_FILE_MARK, footer::FLAG_REMOVE_MARK);
     true
+}
+
+/// Data-segment size of a frame: everything that is not frame header or footer.
+pub(crate) fn frame_capacity(header: &TobHeader) -> usize {
+    let header_size = if header.is_tob2 { 8 } else { 12 };
+    header.frame_nbytes.saturating_sub(header_size + 4)
+}
+
+/// True when a footer word's offset field could describe this frame.
+///
+/// Holds for a main frame footer and for the sub-footer that opens a sub-frame
+/// boundary: both count bytes *inside* the frame, so a value past the data
+/// segment means the word is not a footer at all.
+pub(crate) fn footer_offset_fits(word: u32, header: &TobHeader) -> bool {
+    (word & footer::OFFSET_MASK) as usize <= frame_capacity(header)
 }
 
 /// The record number of the first record in a TOB3 frame (`beg`).
