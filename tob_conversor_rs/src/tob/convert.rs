@@ -4,12 +4,13 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use super::base_scan::FramePass;
 use super::decode::{
     file_datetime_stamp, format_field_toa5, format_ns_timestamp, time_ns_from_frame_header,
 };
-use super::frame_gate::{Admit, FrameGate, FrameStats};
+use super::frame_gate::{Admit, FrameStats};
 use super::header::{TobHeader, parse_tob_header};
-use super::subframe::walk_frame;
+use super::subframe::{FrameWalk, walk_frame};
 
 struct FrameOutput<'a> {
     current_interval: i64,
@@ -83,11 +84,11 @@ fn emit_frame(
     frame_buf: &[u8],
     header: &TobHeader,
     out: &mut FrameOutput,
-) -> Result<usize, String> {
+) -> Result<FrameWalk, String> {
     let mut row_buf = String::with_capacity(256);
     let mut failure: Option<String> = None;
 
-    let rows = walk_frame(frame_buf, header, |line_bytes, frame_time_ns, record_id| {
+    let walk = walk_frame(frame_buf, header, |line_bytes, frame_time_ns, record_id| {
         if failure.is_some() {
             return;
         }
@@ -105,7 +106,7 @@ fn emit_frame(
 
     match failure {
         Some(e) => Err(e),
-        None => Ok(rows),
+        None => Ok(walk),
     }
 }
 
@@ -213,27 +214,30 @@ pub fn convert_streaming_with_stats(
             return Err("frame_nbytes is 0 in non-TOB1 file".to_string());
         }
         let mut frame_buf = vec![0u8; header.frame_nbytes];
-        let mut gate = FrameGate::new();
-        while buff.read_exact(&mut frame_buf).is_ok() {
-            match gate.admit(&frame_buf, &header, |f| {
+        let mut pass = FramePass::start(&mut buff)?;
+        // The pass owns where the next frame comes from: the file from the end
+        // of the header, and then, for a file that turned out to hold nothing
+        // there, each run the recovery scan found.
+        while pass.read_frame(&mut buff, &header, &mut frame_buf) {
+            match pass.gate.admit(&frame_buf, &header, |f| {
                 walk_frame(f, &header, |_, _, _| {})
             }) {
                 Admit::Skip => continue,
                 Admit::Current => {
-                    let rows = emit_frame(&frame_buf, &header, &mut out)?;
-                    gate.advance(rows);
+                    let walk = emit_frame(&frame_buf, &header, &mut out)?;
+                    pass.gate.advance(walk);
                 }
                 Admit::HeldThenCurrent => {
-                    if let Some(held) = gate.take_held() {
+                    if let Some(held) = pass.gate.take_held() {
                         emit_frame(&held, &header, &mut out)?;
                     }
-                    let rows = emit_frame(&frame_buf, &header, &mut out)?;
-                    gate.advance(rows);
+                    let walk = emit_frame(&frame_buf, &header, &mut out)?;
+                    pass.gate.advance(walk);
                 }
             }
         }
-        gate.finish();
-        frame_stats = gate.stats();
+        pass.finish();
+        frame_stats = pass.stats();
     }
 
     if let Some(mut w) = out.out_file.take() {
@@ -241,4 +245,57 @@ pub fn convert_streaming_with_stats(
     }
 
     Ok((out.written_files_count, frame_stats))
+}
+
+/// Read a file's frames and report what they were, without decoding a single
+/// measurement.
+///
+/// This is the cheap verdict a caller needs in front of an ingest: a TOB3 card
+/// whose declared table has no written run at all decodes to zero rows, and so
+/// does a file that was never this table to begin with. Both look identical
+/// from the outside, and telling them apart used to mean scanning the file a
+/// second time. [`FrameStats::frames_accepted`] answers it directly, and
+/// [`FrameStats::recovered`] says whether the rows that *are* there came from
+/// a clean read or from the widened second pass.
+pub fn scan_frame_stats(input: &Path) -> Result<FrameStats, String> {
+    let file = File::open(input).map_err(|e| format!("Open error: {}", e))?;
+    let mut buff = BufReader::new(file);
+    let header = parse_tob_header(&mut buff).map_err(|e| format!("Header parse error: {}", e))?;
+
+    if header.is_tob1 {
+        // A flat record stream: no frames, no ring, nothing to validate.
+        let mut record_buf = vec![0u8; 12 + header.line_nbytes];
+        let mut records = 0u64;
+        while buff.read_exact(&mut record_buf).is_ok() {
+            records += 1;
+        }
+        return Ok(FrameStats {
+            frames_read: records,
+            frames_accepted: records,
+            ..FrameStats::default()
+        });
+    }
+    if header.frame_nbytes == 0 {
+        return Err("frame_nbytes is 0 in non-TOB1 file".to_string());
+    }
+
+    let mut frame_buf = vec![0u8; header.frame_nbytes];
+    let mut pass = FramePass::start(&mut buff)?;
+    while pass.read_frame(&mut buff, &header, &mut frame_buf) {
+        let verdict = pass.gate.admit(&frame_buf, &header, |f| {
+            walk_frame(f, &header, |_, _, _| {})
+        });
+        match verdict {
+            Admit::Skip => continue,
+            Admit::Current | Admit::HeldThenCurrent => {
+                if verdict == Admit::HeldThenCurrent {
+                    pass.gate.take_held();
+                }
+                pass.gate
+                    .advance(walk_frame(&frame_buf, &header, |_, _, _| {}));
+            }
+        }
+    }
+    pass.finish();
+    Ok(pass.stats())
 }

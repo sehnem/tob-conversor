@@ -17,6 +17,7 @@ loading for large files, and a CLI for batch TOA5 / Parquet export.
 | **Column types** | 21 Campbell Scientific types (IEEE4, FP2, INT, BOOL, ASCII, NSEC…) |
 | **NaN handling** | Logger-model-aware FP2 thresholds; `None` / `NaN` in every engine |
 | **Ring-buffer safety** | Unwritten TOB3 ring space is rejected, not decoded as data ([below](#tob3-is-a-ring-buffer)) |
+| **Damaged card images** | A file that reads as empty is re-read for every run it holds ([below](#card-images-that-do-not-read-at-all)) |
 | **Header encoding** | UTF-8 with a Latin-1 fallback, so `W/m²` and accented station names parse |
 | **CLI output** | TOA5 ASCII (30-min split files) or Apache Parquet |
 | **Parallel CLI** | Folder conversions use Rayon (`--jobs N`) |
@@ -40,15 +41,41 @@ to ruin a min/max, a partition key, or an axis.
 This reader therefore also requires that:
 
 - the footer's **offset field fits inside the frame** and only appears together
-  with the minor-frame flag; and
-- the frame's **`beg` record number continues the previous frame**. A frame at
-  a genuine discontinuity (logger restart, ring wrap) is held until the *next*
-  frame corroborates it, so real data survives while junk — which never lines
-  up twice — does not.
+  with the minor-frame flag;
+- the frame's **`beg` record number continues the previous frame**; and
+- the frame **begins in time where the previous one ended**, within a second of
+  whole-second quantization plus a record interval. Junk that lines up on `beg`
+  alone is not rare at two million frames a card, and this is what keeps a 1990
+  or a 2040 run out of a 2025 file.
 
-Rejections are counted rather than hidden: `convert_streaming_with_stats` and
-`TobBatchReader::frame_stats` report `frames_read`, `frames_accepted`,
-`rejected_footer` and `rejected_unconfirmed`.
+A frame at a genuine discontinuity (logger restart, ring wrap) is held until the
+*next* frame corroborates it on both counts, so real data survives while junk —
+which never lines up twice — does not.
+
+Rejections are counted rather than hidden: `convert_streaming_with_stats`,
+`TobBatchReader::frame_stats` and `tob.scan_frames(path)` report `frames_read`,
+`frames_accepted`, `rejected_footer`, `rejected_unconfirmed`, the `frame_base`
+the rows came from, and whether the file had to be `recovered`.
+`frames_accepted == 0` is a verdict in its own right: the declared table was
+never written to this card, as opposed to the file being unreadable.
+
+### Card images that do not read at all
+
+Everything above assumes frame 0 begins where the ASCII prolog ends, and that a
+file holds one run. Both hold for a file a logger wrote; neither holds for
+everything that reaches an archive. A card fragment can have its frames a fixed
+number of bytes off, a prolog's CRLF padding can overlap frame 0, and a reused
+card can hold two *instances* of the same table at two alignments — consecutive
+in time, both real, and invisible to each other. Read at the wrong offset, every
+footer lands mid-record and the file decodes to nothing.
+
+So a file that yields **no rows at all** gets one second pass, and only then:
+the reader scans it for runs — stretches of frames that corroborate each other
+by record number and by the clock — also accepting the `val_stamp ± 1` footers
+that CardConvert and "repair card" fragments carry, and then reads each run it
+found, oldest first. Runs never overlap, so no row is read twice, and a pass
+that produced rows is never replayed, so a healthy file behaves exactly as it
+did before and never pays for any of this.
 
 ---
 
@@ -106,6 +133,18 @@ for chunk in tob.read_tob_chunks("data/CS_120.dat", chunksize=65_536):
 | `read_tob(path, *, engine, include_record, utc)` | `DataFrame` / `Relation` | Eager load into pandas, polars, or DuckDB |
 | `scan_tob(path, *, include_record)` | `TobLazyFrame` | Lazy Polars frame backed by a temp Arrow IPC file |
 | `read_tob_chunks(path, *, chunksize, include_record, utc)` | `Iterator[pd.DataFrame]` | Stream the file as fixed-size pandas chunks |
+| `scan_frames(path)` | `FrameStats` | Walk the frames and report what they were; no measurements decoded |
+
+### `FrameStats` attributes
+
+| Attribute | Type | Description |
+|---|---|---|
+| `frames_read` | `int` | Main frames read from the file |
+| `frames_accepted` | `int` | Frames emitted as data; `0` means the declared table was never written here |
+| `rejected_footer` | `int` | Frames whose footer does not belong to this table |
+| `rejected_unconfirmed` | `int` | Footer-valid frames no neighbour ever corroborated |
+| `frame_base` | `int` | Byte offset the emitted frames were read from |
+| `recovered` | `bool` | The rows came from the second pass over a damaged fragment |
 
 ### `Header` attributes
 

@@ -5,6 +5,22 @@ use super::decode::time_ns_from_frame_header;
 use super::frame_gate::footer_offset_fits;
 use super::header::TobHeader;
 
+/// What one main frame holds: how many records, and where its clock stands
+/// once they are walked.
+///
+/// The two travel together because the frame gate needs both to decide whether
+/// the *next* frame continues this one, and only the walk knows either: the
+/// record count is not a constant (a frame carrying a sub-frame boundary holds
+/// one record fewer) and neither is the clock (a boundary restates it outright).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameWalk {
+    /// Records the frame holds.
+    pub rows: usize,
+    /// Timestamp the record *after* the last one would carry — where a frame
+    /// that genuinely continues this one has to begin.
+    pub end_time_ns: i64,
+}
+
 /// Where in time the next record of a frame sits.
 ///
 /// A sub-frame boundary restates the frame's whole time base, so the raw
@@ -119,14 +135,15 @@ pub(crate) fn scan_and_skip_subframe_boundary(
 }
 
 /// Walk one main frame, calling `on_row(line_bytes, frame_time_ns, record_id)`
-/// for every record it holds.  Returns the number of rows walked.
+/// for every record it holds.
 ///
 /// This is the single definition of "how many rows are in this frame and when
-/// did each happen" — the TOA5 writer, the Arrow collector and the frame gate's
-/// row count all go through it, so they cannot drift apart.  The count is not a
-/// constant: a frame carrying a sub-frame boundary spends 16 of its data bytes
-/// on that boundary and so holds one record fewer.
-pub(crate) fn walk_frame<F>(frame_buf: &[u8], header: &TobHeader, mut on_row: F) -> usize
+/// did each happen" — the TOA5 writer, the Arrow collector and the frame gate
+/// all go through it, so they cannot drift apart.  Neither half of
+/// [`FrameWalk`] is a constant: a frame carrying a sub-frame boundary spends 16
+/// of its data bytes on that boundary, so it holds one record fewer, and the
+/// boundary restates the frame's time base on top of that.
+pub(crate) fn walk_frame<F>(frame_buf: &[u8], header: &TobHeader, mut on_row: F) -> FrameWalk
 where
     F: FnMut(&[u8], i64, u32),
 {
@@ -171,10 +188,18 @@ where
         rows += 1;
 
         next_record_id = next_record_id.wrapping_add(1);
-        clock.time_ns += (header.rec_intvl * 1_000_000_000.0) as i64;
+        // Saturating: a junk frame can decode a `seconds` field near 2^32, and
+        // stepping past the end of i64 nanoseconds must not panic on the way
+        // to rejecting it.
+        clock.time_ns = clock
+            .time_ns
+            .saturating_add((header.rec_intvl * 1_000_000_000.0) as i64);
     }
 
-    rows
+    FrameWalk {
+        rows,
+        end_time_ns: clock.time_ns,
+    }
 }
 
 #[cfg(test)]
@@ -245,7 +270,7 @@ mod tests {
         for stamp in [4659u16, 4660, 4661] {
             let frame = frame_with_boundary(27_698, stamp);
             let mut ids = Vec::new();
-            let n = walk_frame(&frame, &h, |_, _, rec| ids.push(rec));
+            let n = walk_frame(&frame, &h, |_, _, rec| ids.push(rec)).rows;
             assert_eq!(n, 2, "stamp {stamp}: expected 2 records, walked {n}");
             assert_eq!(ids, vec![27_698, 27_699], "stamp {stamp}");
         }
@@ -259,7 +284,7 @@ mod tests {
         let mut frame = frame_with_boundary(27_698, 4659);
         // Break only the sub-header record id.
         frame[26..30].copy_from_slice(&9_999_999u32.to_le_bytes());
-        let n = walk_frame(&frame, &h, |_, _, _| {});
+        let n = walk_frame(&frame, &h, |_, _, _| {}).rows;
         assert!(
             n > 2,
             "boundary must not be taken on the stamp alone (got {n})"
@@ -284,7 +309,7 @@ mod tests {
         let frame = one_frame_bytes(1, 0, 4660);
         // 20-byte frame: 12 header + 4 data + 4 footer = one 4-byte record.
         let mut seen = Vec::new();
-        let n = walk_frame(&frame, &h, |bytes, _ns, rec| seen.push((bytes.len(), rec)));
+        let n = walk_frame(&frame, &h, |bytes, _ns, rec| seen.push((bytes.len(), rec))).rows;
         assert_eq!(n, 1);
         assert_eq!(seen, vec![(4, 0)]);
     }
@@ -294,7 +319,66 @@ mod tests {
         let h = header();
         let frame = one_frame_bytes(7, 42, 4660);
         let mut counted = 0usize;
-        let n = walk_frame(&frame, &h, |_, _, _| counted += 1);
+        let n = walk_frame(&frame, &h, |_, _, _| counted += 1).rows;
         assert_eq!(n, counted);
+    }
+
+    /// The walk reports where its clock ended, and a sub-frame boundary is
+    /// folded into that. The frame gate compares the next frame's start
+    /// against this number, so getting it from the raw frame header instead
+    /// would make every boundary-carrying frame look like a time jump.
+    #[test]
+    fn the_walk_reports_the_clock_after_the_last_record() {
+        let h = header_36();
+        // Boundary restates the base to 200 s; one record follows it at 1 SEC.
+        let walk = walk_frame(&frame_with_boundary(27_698, 4659), &h, |_, _, _| {});
+        assert_eq!(walk.rows, 2);
+        assert_eq!(
+            walk.end_time_ns,
+            time_ns_from_frame_header(201, 0, h.frame_time_res)
+        );
+    }
+
+    /// EX-6: a TOB2 sub-header carries no record id, so the stamp is the whole
+    /// test there and has to stay exact. This is the guard rail for that: if
+    /// the off-by-one neighbourhood ever reaches the TOB2 branch, a boundary
+    /// gets taken on a coincidence with nothing to corroborate it.
+    #[test]
+    fn tob2_boundaries_still_demand_an_exact_stamp() {
+        let hdr = r#""TOB2","S","CR1000","1","O","P","G","D"
+"T","1 SEC","28","0","4660","SecMsec","0","0","0"
+"a"
+"u"
+"S"
+"FP2"
+"#;
+        let h = parse_tob_header(&mut Cursor::new(hdr)).unwrap();
+        assert!(h.is_tob2);
+        // 28 bytes: 8 header + 12 boundary + 2 data + 2 data + 4 footer.
+        let tob2_frame = |boundary_stamp: u16| {
+            let mut f = Vec::new();
+            f.extend_from_slice(&100u32.to_le_bytes()); // seconds
+            f.extend_from_slice(&0u32.to_le_bytes()); // subseconds
+            f.extend_from_slice(&((boundary_stamp as u32) << 16).to_le_bytes()); // sub-footer
+            f.extend_from_slice(&200u32.to_le_bytes()); // restated seconds
+            f.extend_from_slice(&0u32.to_le_bytes()); // restated subseconds
+            f.extend_from_slice(&[0x45, 0x8e]); // one record
+            f.extend_from_slice(&[0x45, 0x8e]); // one more record
+            f.extend_from_slice(&(4660u32 << 16).to_le_bytes()); // main footer
+            assert_eq!(f.len(), 28);
+            f
+        };
+        // The table's own stamp is taken as a boundary: two records on the
+        // restated time base, not on the one the frame header declares.
+        let mut times = Vec::new();
+        let exact = walk_frame(&tob2_frame(4660), &h, |_, ns, _| times.push(ns));
+        assert_eq!(exact.rows, 2);
+        assert_eq!(
+            times[0],
+            time_ns_from_frame_header(200, 0, h.frame_time_res)
+        );
+        // One off is not: the 12 boundary bytes are read as measurements, so
+        // the frame reports far more records than it holds.
+        assert_eq!(walk_frame(&tob2_frame(4659), &h, |_, _, _| {}).rows, 8);
     }
 }

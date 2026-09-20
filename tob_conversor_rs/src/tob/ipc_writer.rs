@@ -14,10 +14,11 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_ipc::writer::{FileWriter, StreamWriter};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
+use super::base_scan::FramePass;
 use super::decode::{FieldValue, decode_field_value, time_ns_from_frame_header};
-use super::frame_gate::{Admit, FrameGate, FrameStats};
+use super::frame_gate::{Admit, FrameStats};
 use super::header::{TobHeader, parse_tob_header};
-use super::subframe::walk_frame;
+use super::subframe::{FrameWalk, walk_frame};
 use super::types::CsciType;
 
 /// Default batch size — keeps peak memory at ~4–10 MiB per chunk.
@@ -352,7 +353,11 @@ pub(crate) fn build_schema(header: &TobHeader, include_record: bool) -> Schema {
 
 // ── Frame and record collectors ───────────────────────────────────────────────
 
-pub(crate) fn collect_frame(frame_buf: &[u8], header: &TobHeader, buffers: &mut Buffers) -> usize {
+pub(crate) fn collect_frame(
+    frame_buf: &[u8],
+    header: &TobHeader,
+    buffers: &mut Buffers,
+) -> FrameWalk {
     walk_frame(frame_buf, header, |line_bytes, frame_time_ns, record_id| {
         buffers.timestamps.push(frame_time_ns);
         buffers.records.push(record_id as i64);
@@ -434,7 +439,8 @@ pub struct TobBatchReader {
     done: bool,
     frame_buf: Vec<u8>,
     record_buf: Vec<u8>,
-    gate: FrameGate,
+    pass: FramePass,
+    tob1_records: u64,
 }
 
 impl TobBatchReader {
@@ -444,6 +450,7 @@ impl TobBatchReader {
         let mut reader = BufReader::new(file);
         let header =
             parse_tob_header(&mut reader).map_err(|e| format!("Header parse error: {}", e))?;
+        let pass = FramePass::start(&mut reader)?;
         let schema = Arc::new(build_schema(&header, include_record));
         let buffers = Buffers::new(&header.csci_dtypes);
 
@@ -466,7 +473,8 @@ impl TobBatchReader {
             done: false,
             frame_buf,
             record_buf,
-            gate: FrameGate::new(),
+            pass,
+            tob1_records: 0,
         })
     }
 
@@ -480,8 +488,21 @@ impl TobBatchReader {
 
     /// Main frames read so far, and how many were rejected as not belonging to
     /// this table.  Meaningful once iteration has finished.
+    ///
+    /// `frames_accepted == 0` on a finished read is the "no run of this table
+    /// anywhere in the file" verdict — a file that is empty rather than
+    /// mislabelled — and it is reached without scanning the file again.
     pub fn frame_stats(&self) -> FrameStats {
-        self.gate.stats()
+        if self.header.is_tob1 {
+            // TOB1 is a flat record stream with no frames and no ring to
+            // validate; every record read is a record kept.
+            return FrameStats {
+                frames_read: self.tob1_records,
+                frames_accepted: self.tob1_records,
+                ..FrameStats::default()
+            };
+        }
+        self.pass.stats()
     }
 }
 
@@ -500,33 +521,40 @@ impl Iterator for TobBatchReader {
                     break;
                 }
                 collect_tob1_record(&self.record_buf, &self.header, &mut self.buffers);
+                self.tob1_records += 1;
                 if self.buffers.len() >= self.batch_size {
                     break;
                 }
             }
         } else {
             loop {
-                if self.reader.read_exact(&mut self.frame_buf).is_err() {
+                // The pass owns where the next frame comes from: the file from
+                // the end of the header, and then, for a file that turned out
+                // to hold nothing there, each run the recovery scan found.
+                if !self
+                    .pass
+                    .read_frame(&mut self.reader, &self.header, &mut self.frame_buf)
+                {
+                    self.pass.finish();
                     self.done = true;
-                    self.gate.finish();
                     break;
                 }
                 let header = &self.header;
-                let verdict = self.gate.admit(&self.frame_buf, header, |f| {
+                let verdict = self.pass.gate.admit(&self.frame_buf, header, |f| {
                     walk_frame(f, header, |_, _, _| {})
                 });
                 match verdict {
                     Admit::Skip => continue,
                     Admit::Current => {
-                        let rows = collect_frame(&self.frame_buf, &self.header, &mut self.buffers);
-                        self.gate.advance(rows);
+                        let walk = collect_frame(&self.frame_buf, &self.header, &mut self.buffers);
+                        self.pass.gate.advance(walk);
                     }
                     Admit::HeldThenCurrent => {
-                        if let Some(held) = self.gate.take_held() {
+                        if let Some(held) = self.pass.gate.take_held() {
                             collect_frame(&held, &self.header, &mut self.buffers);
                         }
-                        let rows = collect_frame(&self.frame_buf, &self.header, &mut self.buffers);
-                        self.gate.advance(rows);
+                        let walk = collect_frame(&self.frame_buf, &self.header, &mut self.buffers);
+                        self.pass.gate.advance(walk);
                     }
                 }
                 if self.buffers.len() >= self.batch_size {

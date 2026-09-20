@@ -19,7 +19,11 @@ fn multiple_frames_file_split() {
     let input = dir.join("split.dat");
     let mut blob = header_block("CR1000", 20, VAL_STAMP).into_bytes();
     blob.extend(one_frame(100, 1, VAL_STAMP));
+    // A gap: the logger was off, so the record numbers carry on but the clock
+    // jumps. The frame that resumes is corroborated by the one after it, the
+    // same way every other discontinuity is.
     blob.extend(one_frame(100 + 1900, 2, VAL_STAMP));
+    blob.extend(one_frame(100 + 1901, 3, VAL_STAMP));
     fs::File::create(&input).unwrap().write_all(&blob).unwrap();
     let out = dir.join("out");
     let n = convert_streaming(&input, &out, 30, false).unwrap();
@@ -27,6 +31,13 @@ fn multiple_frames_file_split() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A frame whose footer stamp belongs to some other table is not this table's,
+/// and the genuine run on either side of it reads normally.
+///
+/// The genuine frames come in pairs on purpose. Past the ring's write pointer
+/// a stamp collision is common enough (~1 junk frame in 2^17) that a single
+/// footer-valid frame proves nothing on its own: only a frame whose neighbour
+/// continues it — same record ladder, same clock — is emitted.
 #[test]
 fn invalid_frame_is_skipped() {
     let dir = temp_dir("invalid");
@@ -35,7 +46,9 @@ fn invalid_frame_is_skipped() {
     let input = dir.join("inv.dat");
     let mut blob = header_block("CR1000", 20, VAL_STAMP).into_bytes();
     blob.extend(one_frame_invalid(100, 1, VAL_STAMP));
-    blob.extend(one_frame(200, 1, VAL_STAMP));
+    // 1 SEC table, one record a frame: record 5 at t, record 6 at t + 1 s.
+    blob.extend(one_frame(200, 5, VAL_STAMP));
+    blob.extend(one_frame(201, 6, VAL_STAMP));
     fs::File::create(&input).unwrap().write_all(&blob).unwrap();
     let out = dir.join("out");
     let n = convert_streaming(&input, &out, 30, false).unwrap();
@@ -53,9 +66,13 @@ fn invalid_frame_is_skipped() {
     let data_lines: Vec<_> = text.lines().skip(4).collect();
     assert_eq!(
         data_lines.len(),
-        1,
-        "only one valid row; got {:?}",
+        2,
+        "the two genuine frames, and not the foreign one; got {:?}",
         data_lines
+    );
+    assert!(
+        !text.contains("1990-01-01 00:01:40"),
+        "the foreign frame's 100 s timestamp must not appear:\n{text}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

@@ -10,18 +10,21 @@ if TYPE_CHECKING:
     import pandas as pd
     import polars as pl
 
-from tob._core import Header, to_parquet
+from tob._core import FrameStats, Header, to_parquet
 from tob._core import read_header as _read_header
+from tob._core import scan_frames as _scan_frames
 from tob._lazy import TobLazyFrame
 from tob.duckdb import open_tob
 
 __all__ = [
+    "FrameStats",
     "Header",
     "TobLazyFrame",
     "open_tob",
     "read_header",
     "read_tob",
     "read_tob_chunks",
+    "scan_frames",
     "scan_tob",
     "to_parquet",
 ]
@@ -30,6 +33,29 @@ __all__ = [
 def read_header(path: str | Path) -> Header:
     """Parse the 6-line ASCII TOB header without reading binary data."""
     return _read_header(str(Path(path)))
+
+
+def scan_frames(path: str | Path) -> FrameStats:
+    """Report what a file's frames are, without decoding any measurements.
+
+    A TOB3 file is a pre-allocated ring buffer, so most of a card image is
+    usually *not* data: past the logger's write pointer it holds whatever was
+    there before.  This walks the frames and counts them, which answers two
+    questions a row count cannot:
+
+    * ``frames_accepted == 0`` — the declared table was never written to this
+      card.  An empty file, not a mislabelled or unreadable one.
+    * ``recovered`` — the rows that are there came from the second, widened
+      pass over a damaged fragment rather than from a clean read, so they are
+      worth flagging in a provenance log.
+
+    Examples
+    --------
+    >>> stats = tob.scan_frames("card.dat")  # doctest: +SKIP
+    >>> stats.frames_accepted, stats.frames_read  # doctest: +SKIP
+    (620883, 2055272)
+    """
+    return _scan_frames(str(Path(path)))
 
 
 @overload

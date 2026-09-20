@@ -91,6 +91,38 @@ def tob3_file_with_nan(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
+def tob3_off_by_one_file(tmp_path: Path) -> Path:
+    """A card fragment whose main footers carry ``val_stamp + 1``.
+
+    CardConvert and "repair card" write these, and read strictly the file is
+    empty.  Four frames, so the run is long enough to be more than a
+    coincidence, with record numbers and a 1 SEC clock that agree.
+    """
+    frames = b"".join(_tob3_frame(100 + i, 1 + i, val_stamp=VAL_STAMP + 1) for i in range(4))
+    path = tmp_path / "offbyone.dat"
+    path.write_bytes(_tob3_header() + frames)
+    return path
+
+
+@pytest.fixture()
+def tob3_junk_only_file(tmp_path: Path) -> Path:
+    """A card whose declared table was never written to it.
+
+    A handful of footer stamps collide by chance — one junk frame in 2^17 does
+    — but nothing continues anything, so there are no rows to be had.
+    """
+    frames = []
+    for i in range(40):
+        if i and i % 9 == 0:
+            frames.append(_tob3_frame(0xDEAD_0000 + i, 0xABCD_0000 ^ i))
+        else:
+            frames.append(_tob3_frame(i, i, val_stamp=VAL_STAMP ^ 0x0F0F))
+    path = tmp_path / "junk.dat"
+    path.write_bytes(_tob3_header() + b"".join(frames))
+    return path
+
+
+@pytest.fixture()
 def tob1_file(tmp_path: Path) -> Path:
     """TOB1 file with 2 FP2 columns, 2 records."""
     data = (
