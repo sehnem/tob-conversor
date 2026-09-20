@@ -134,7 +134,8 @@ impl FrameStats {
             self.rejected_footer,
             self.rejected_unconfirmed,
             self.frame_base,
-            self.recovered
+            // Python spelling: this repr is read in a Python REPL, not a Rust one.
+            if self.recovered { "True" } else { "False" }
         )
     }
 }
